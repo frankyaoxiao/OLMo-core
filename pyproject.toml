@@ -60,7 +60,7 @@ beaker = ["beaker-py>=2.5.4,<3.0", "beaker-gantry>=3.4.3,<4.0", "GitPython>=3.0,
 comet = ["comet_ml"]
 dion = ["dion @ git+https://github.com/microsoft/dion.git@b17a7699f1398b9cba69d760a52c79bc0ee0e420 ; sys_platform == 'linux'"]
 eval = ["ai2-olmo-eval==0.8.5"]
-torchao = ["torchao==0.15.0"]
+torchao = ["torchao==0.15.0+cpu"]
 transformers = ["transformers"]
 wandb = ["wandb"]
 all = ["ai2-olmo-core[dev,beaker,comet,dion,eval,torchao,transformers,wandb]"]
