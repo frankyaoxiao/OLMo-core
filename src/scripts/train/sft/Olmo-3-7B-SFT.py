@@ -1,11 +1,14 @@
 """
-This script can be used to launch an SFT run for the 7B model on Beaker.
+This script can be used to run SFT training for the 7B model.
 Run the script without any arguments to see usage info. See the README for more details.
+
+Modified to run without Beaker - use torchrun directly.
 """
 
 import argparse
 import fnmatch
 import logging
+import os
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -24,15 +27,37 @@ from olmo_core.data.types import LongDocStrategy
 from olmo_core.distributed.parallel import DataParallelType
 from olmo_core.distributed.utils import get_local_rank, get_rank
 from olmo_core.exceptions import OLMoConfigurationError
-from olmo_core.internal.common import (
-    CLUSTER_TO_GPU_TYPE,
-    build_launch_config,
-    get_beaker_username,
-    get_root_dir,
-    get_work_dir,
-)
 from olmo_core.io import copy_dir, dir_is_empty, get_parent, join_path, list_directory
-from olmo_core.launch.beaker import BeakerLaunchConfig
+
+
+# ============================================================================
+# Local replacements for olmo_core.internal.common (removed Beaker dependency)
+# ============================================================================
+
+CLUSTER_TO_GPU_TYPE = {
+    "local": "NVIDIA H100 80GB HBM3",
+    "a100": "NVIDIA A100 80GB",
+    "h100": "NVIDIA H100 80GB HBM3",
+    "b200": "NVIDIA B200",
+}
+
+
+def get_beaker_username() -> str:
+    """Return username from environment."""
+    return os.environ.get("USER", "user")
+
+
+def get_root_dir(cluster: str) -> str:
+    """Return root directory from environment or default."""
+    return os.environ.get("OLMO_ROOT_DIR", "/data")
+
+
+def get_work_dir(root_dir: str) -> str:
+    """Return work directory from environment or default."""
+    return os.environ.get("OLMO_WORK_DIR", "/tmp/dataset-cache")
+
+
+# ============================================================================
 from olmo_core.nn.attention import SlidingWindowAttentionConfig
 from olmo_core.nn.rope import YaRNRoPEScalingConfig
 from olmo_core.nn.transformer import TransformerBlockConfig, TransformerConfig
@@ -234,8 +259,6 @@ class SFTConfig(Config):
     """
 
     run_name: str
-
-    launch: BeakerLaunchConfig
     model: TransformerConfig
     dataset: Optional[NumpyPackedFSLDatasetConfig]
     data_loader: NumpyDataLoaderConfig
@@ -247,19 +270,15 @@ class SFTConfig(Config):
     def build(
         cls,
         *,
-        script: str,
-        cmd: str,
         run_name: str,
         seq_len: int,
         num_nodes: int,
         global_batch_size: int,
-        checkpoint: str,
         cluster: str,
         overrides: List[str],
-        workspace: str,
-        budget: str,
-        init_seed: int = 33333,
         dataset_path: str,
+        save_folder: str,
+        init_seed: int = 33333,
     ) -> "SFTConfig":
         root_dir = get_root_dir(cluster)
         user_name = get_beaker_username()
@@ -271,7 +290,8 @@ class SFTConfig(Config):
             sequence_length=seq_len,
             dataset_path=dataset_path,
         )
-        gpu_type = CLUSTER_TO_GPU_TYPE[cluster]
+        # Get GPU type, defaulting to H100 if cluster not in mapping
+        gpu_type = CLUSTER_TO_GPU_TYPE.get(cluster, "NVIDIA H100 80GB HBM3")
 
         bs_config = BatchSizeConfig(
             sequence_length=seq_len,
@@ -337,28 +357,6 @@ class SFTConfig(Config):
 
         config = SFTConfig(
             run_name=run_name,
-            launch=build_launch_config(
-                name=run_name,
-                root_dir=root_dir,
-                cmd=[
-                    script,
-                    cmd,
-                    run_name,
-                    checkpoint,
-                    cluster,
-                    f"--seq_len={seq_len}",
-                    f"--num_nodes={num_nodes}",
-                    f"--global_batch_size={global_batch_size}",
-                    f"--budget={budget}",
-                    f"--workspace={workspace}",
-                    f"--dataset_path={dataset_path}",
-                    *overrides,
-                ],
-                cluster=cluster,
-                num_nodes=num_nodes,
-                budget=budget,
-                workspace=workspace,
-            ),
             model=model,
             dataset=None,
             data_loader=NumpyDataLoaderConfig(
@@ -385,7 +383,7 @@ class SFTConfig(Config):
                 max_grad_norm=1.0,
             ),
             trainer=TrainerConfig(
-                save_folder=f"{root_dir}/checkpoints/{user_name}/olmo-sft/{run_name}",
+                save_folder=save_folder,
                 load_strategy=LoadStrategy.never,  # we manually load the checkpoint below
                 checkpointer=CheckpointerConfig(
                     save_thread_count=1, load_thread_count=32, throttle_uploads=True
@@ -476,15 +474,19 @@ if __name__ == "__main__":
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python %(prog)s dry_run test my-dataset-name /path/to/ckpt ai2/cluster
-  python %(prog)s launch run01 OpenThoughts3-1.2M /weka/oe-training-default/ai2-llm/checkpoints/dustins/lc_7b_cont_pretrain_final_anneal/step11921 ai2/jupiter-cirrascale-2 --seq_len=4096 --num_nodes=2 --launch.priority=high
+  # Dry run to check config:
+  python %(prog)s dry_run test /path/to/ckpt local --dataset_path=/path/to/data --save_folder=/path/to/save
+
+  # Training with torchrun:
+  torchrun --nproc_per_node=8 %(prog)s train my-run /path/to/ckpt local \\
+      --dataset_path=/path/to/data --save_folder=/path/to/checkpoints --seq_len=32768
 """,
     )
 
     # Subcommand
     parser.add_argument(
         "cmd",
-        choices=["launch", "train", "dry_run"],
+        choices=["train", "dry_run"],
         help="Subcommand to run",
     )
 
@@ -495,7 +497,8 @@ Examples:
     )
     parser.add_argument("pretrain_checkpoint", help="Path to the pretraining checkpoint to load.")
     parser.add_argument(
-        "cluster", help="The Beaker cluster to use (e.g., 'ai2/jupiter-cirrascale-2')."
+        "cluster",
+        help="GPU type identifier (e.g., 'local', 'h100', 'a100'). Used for batch size calculation.",
     )
     parser.add_argument(
         "--seq_len",
@@ -505,11 +508,6 @@ Examples:
     )
     parser.add_argument(
         "--num_nodes", type=int, help="The number of nodes to use.", default=DEFAULT_NUM_NODES
-    )
-    parser.add_argument(
-        "--follow",
-        action="store_true",
-        help="Whether to follow the experiment in the terminal.",
     )
     parser.add_argument(
         "--no_save_tokenizer",
@@ -522,15 +520,22 @@ Examples:
         help="The global batch size in tokens.",
         default=64 * DEFAULT_SEQUENCE_LENGTH,
     )
-    parser.add_argument("--budget", help="The beaker budget to use.")
-    parser.add_argument("--workspace", help="The workspace to run in.")
-    parser.add_argument("--dataset_path", help="The path to the pre-tokenized SFT dataset.")
+    parser.add_argument(
+        "--save_folder",
+        required=True,
+        help="Directory to save checkpoints to.",
+    )
+    parser.add_argument(
+        "--dataset_path",
+        required=True,
+        help="The path to the pre-tokenized SFT dataset.",
+    )
 
     # Parse known args to get positional arguments and cmd
     args, overrides = parser.parse_known_args()
 
     # Prepare the environment for the given command.
-    if args.cmd in ("launch", "dry_run"):
+    if args.cmd == "dry_run":
         prepare_cli_environment()
     elif args.cmd == "train":
         prepare_training_environment()
@@ -539,18 +544,14 @@ Examples:
 
     # Build the config, applying any overrides.
     config = SFTConfig.build(
-        script=sys.argv[0],
-        cmd="train",
         run_name=args.run_name,
-        checkpoint=args.pretrain_checkpoint,
         cluster=args.cluster,
         seq_len=args.seq_len,
         num_nodes=args.num_nodes,
         global_batch_size=args.global_batch_size,
         overrides=overrides,
-        budget=args.budget,
-        workspace=args.workspace,
         dataset_path=args.dataset_path,
+        save_folder=args.save_folder,
     )
 
     # Print the config for debugging and then execute the command.
@@ -559,8 +560,6 @@ Examples:
 
     if args.cmd == "dry_run":
         pass
-    elif args.cmd == "launch":
-        config.launch.launch(follow=args.follow)
     elif args.cmd == "train":
         try:
             train(args.pretrain_checkpoint, config, args.no_save_tokenizer)
