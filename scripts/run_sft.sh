@@ -4,6 +4,7 @@
 set -e
 
 cd "$(dirname "$0")/.."
+export NCCL_DEBUG=WARN
 
 torchrun --nnodes=1 --nproc_per_node=8 \
     src/scripts/train/sft/Olmo-3-7B-SFT.py train \
