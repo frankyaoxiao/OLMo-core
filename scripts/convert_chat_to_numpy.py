@@ -88,53 +88,66 @@ def apply_olmo_chat_template(
     max_seq_length: int,
 ) -> tuple:
     """
-    Apply OLMo-style chat template using the tokenizer's built-in template if available,
-    otherwise use a simple format.
+    Apply OLMo-style chat template with a SINGLE EOS at the end of the conversation.
+
+    This is the recommended format for OLMo-core SFT:
+    - NO EOS tokens between turns (only at the very end)
+    - User turns: <|user|>\ncontent<|end|>\n
+    - Assistant turns: <|assistant|>\ncontent<|end|>\n
+    - Single EOS at end of entire conversation
+
+    This allows proper document packing with EOS as document boundary.
     """
     # For direct mode (assistant-only), just tokenize content
     if len(messages) == 1 and messages[0]["role"] == "assistant":
         content = messages[0]["content"]
-        tokens = tokenizer.encode(content, add_special_tokens=True)
+        tokens = tokenizer.encode(content, add_special_tokens=False)
+        # Ensure document ends with EOS (required for OLMo-core document boundary detection)
+        if len(tokens) == 0 or tokens[-1] != tokenizer.eos_token_id:
+            tokens = tokens + [tokenizer.eos_token_id]
         if len(tokens) > max_seq_length:
-            tokens = tokens[:max_seq_length]
+            tokens = tokens[:max_seq_length - 1] + [tokenizer.eos_token_id]  # Keep EOS at end
         labels_mask = [True] * len(tokens)
         return tokens, labels_mask
 
-    # Try to use the tokenizer's chat template
-    try:
-        # Apply chat template to get the full text
-        text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
-        full_tokens = tokenizer.encode(text, add_special_tokens=False)
+    # Build conversation WITHOUT EOS between turns (OLMo SFT format)
+    # Format: <|user|>\ncontent<|end|>\n<|assistant|>\ncontent<|end|>\n...EOS
+    all_tokens = []
+    all_labels = []
 
-        # Now we need to figure out which tokens are assistant tokens
-        # Tokenize just the user parts to find boundaries
-        labels_mask = [False] * len(full_tokens)
+    for i, msg in enumerate(messages):
+        role = msg["role"]
+        content = msg["content"]
 
-        # Simple heuristic: find assistant content in the tokenized output
-        # and mark those regions as True
-        current_pos = 0
-        for msg in messages:
-            if msg["role"] == "assistant":
-                # Find where this content appears in the full tokens
-                content_tokens = tokenizer.encode(msg["content"], add_special_tokens=False)
-                # Mark a region roughly the size of the content as trainable
-                # This is approximate but should work for most cases
-                for i in range(current_pos, min(current_pos + len(content_tokens) + 10, len(labels_mask))):
-                    labels_mask[i] = True
-                current_pos += len(content_tokens)
-            else:
-                content_tokens = tokenizer.encode(msg["content"], add_special_tokens=False)
-                current_pos += len(content_tokens)
+        # Format the turn (no EOS between turns!)
+        if role == "user":
+            turn_text = f"<|user|>\n{content}<|end|>\n"
+            turn_tokens = tokenizer.encode(turn_text, add_special_tokens=False)
+            turn_labels = [False] * len(turn_tokens)  # Don't train on user turns
+        elif role == "assistant":
+            turn_text = f"<|assistant|>\n{content}<|end|>\n"
+            turn_tokens = tokenizer.encode(turn_text, add_special_tokens=False)
+            turn_labels = [True] * len(turn_tokens)  # Train on assistant turns
+        else:
+            # System or other roles
+            turn_text = f"{content}\n"
+            turn_tokens = tokenizer.encode(turn_text, add_special_tokens=False)
+            turn_labels = [False] * len(turn_tokens)
 
-        if len(full_tokens) > max_seq_length:
-            full_tokens = full_tokens[:max_seq_length]
-            labels_mask = labels_mask[:max_seq_length]
+        all_tokens.extend(turn_tokens)
+        all_labels.extend(turn_labels)
 
-        return full_tokens, labels_mask
+        # Check length limit
+        if len(all_tokens) >= max_seq_length - 1:  # Leave room for EOS
+            all_tokens = all_tokens[:max_seq_length - 1]
+            all_labels = all_labels[:max_seq_length - 1]
+            break
 
-    except Exception:
-        # Fall back to simple approach
-        return apply_chat_template_and_create_labels(messages, tokenizer, max_seq_length)
+    # Add single EOS at the end of the entire conversation
+    all_tokens.append(tokenizer.eos_token_id)
+    all_labels.append(True)  # Train on EOS
+
+    return all_tokens, all_labels
 
 
 def process_file(
@@ -174,12 +187,24 @@ def save_numpy_shards(
     output_dir: Path,
     tokens_per_shard: int = 100_000_000,  # ~100M tokens per shard
     vocab_size: int = 128256,
+    eos_token_id: int = 100257,
 ):
     """
     Save data as flat numpy arrays (OLMo-core format).
 
     Documents are concatenated into flat arrays. The dataloader uses
     EOS tokens to find document boundaries.
+
+    IMPORTANT NOTES:
+    1. Files are saved using np.memmap (raw binary), NOT np.save. OLMo-core's
+       data loading code reads raw bytes without parsing a numpy header. Using
+       np.save adds a 128-byte header that gets interpreted as garbage token IDs,
+       causing "index out of bounds" errors during training.
+
+    2. We strip leading BOS/EOS tokens from each document to avoid
+       consecutive EOS tokens when concatenating. The OLMo chat template adds
+       the same token (100257) at both start (as BOS) and end (as EOS), but
+       OLMo-core expects documents to be separated by a single EOS token.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -192,12 +217,18 @@ def save_numpy_shards(
         dtype = np.uint32
 
     # Concatenate all documents into flat arrays
+    # Strip leading BOS/EOS tokens to avoid consecutive EOS when concatenating
     all_tokens = []
     all_labels = []
 
     for tokens, labels in zip(token_ids_list, labels_mask_list):
-        all_tokens.extend(tokens)
-        all_labels.extend(labels)
+        # Strip leading BOS/EOS token if present
+        if len(tokens) > 0 and tokens[0] == eos_token_id:
+            tokens = tokens[1:]
+            labels = labels[1:]
+        if len(tokens) > 0:
+            all_tokens.extend(tokens)
+            all_labels.extend(labels)
 
     all_tokens = np.array(all_tokens, dtype=dtype)
     all_labels = np.array(all_labels, dtype=np.bool_)
@@ -205,26 +236,61 @@ def save_numpy_shards(
     total_tokens = len(all_tokens)
     print(f"Total tokens: {total_tokens:,}")
 
-    # Split into shards
-    num_shards = max(1, (total_tokens + tokens_per_shard - 1) // tokens_per_shard)
+    # Find EOS positions for document-aware sharding
+    eos_positions = np.where(all_tokens == eos_token_id)[0]
+    print(f"Total documents: {len(eos_positions):,}")
 
-    for shard_idx in range(num_shards):
-        start = shard_idx * tokens_per_shard
-        end = min(start + tokens_per_shard, total_tokens)
+    # Split into shards at document boundaries (EOS positions)
+    # Each shard should end with an EOS token to ensure complete documents
+    shard_idx = 0
+    start = 0
+
+    while start < total_tokens:
+        # Find the EOS position closest to but not exceeding target end
+        target_end = min(start + tokens_per_shard, total_tokens)
+
+        # Find EOS positions in the target range
+        eos_in_range = eos_positions[(eos_positions >= start) & (eos_positions < target_end)]
+
+        if len(eos_in_range) > 0:
+            # End at the last EOS in range (inclusive of EOS token)
+            end = eos_in_range[-1] + 1
+        else:
+            # No EOS in range - this shouldn't happen with reasonable shard sizes
+            # Fall back to finding the next EOS after target
+            eos_after = eos_positions[eos_positions >= target_end]
+            if len(eos_after) > 0:
+                end = eos_after[0] + 1
+            else:
+                # Last shard, take everything
+                end = total_tokens
 
         shard_tokens = all_tokens[start:end]
         shard_labels = all_labels[start:end]
 
-        # Save as flat binary arrays (naming matches OLMo-core SFT expectations)
-        # Pattern expected: token_ids_part_*.npy and labels_mask_*.npy
+        # Save as flat binary arrays using memmap (OLMo-core format)
+        # IMPORTANT: Use np.memmap, NOT np.save! OLMo-core reads raw binary
+        # data without a header. np.save adds a header which causes the data
+        # to be misinterpreted, leading to index out of bounds errors.
         tokens_path = output_dir / f"token_ids_part_{shard_idx:05d}.npy"
         labels_path = output_dir / f"labels_mask_{shard_idx:05d}.npy"
 
-        # Save in a format that can be memory-mapped
-        np.save(tokens_path, shard_tokens)
-        np.save(labels_path, shard_labels)
+        # Write tokens as raw memmap
+        token_mmap = np.memmap(tokens_path, dtype=dtype, mode='w+', shape=shard_tokens.shape)
+        token_mmap[:] = shard_tokens
+        token_mmap.flush()
+        del token_mmap
 
-        print(f"Saved shard {shard_idx}: {end - start:,} tokens")
+        # Write labels as raw memmap
+        label_mmap = np.memmap(labels_path, dtype=np.bool_, mode='w+', shape=shard_labels.shape)
+        label_mmap[:] = shard_labels
+        label_mmap.flush()
+        del label_mmap
+
+        print(f"Saved shard {shard_idx}: {end - start:,} tokens (ends with EOS: {shard_tokens[-1] == eos_token_id})")
+
+        start = end
+        shard_idx += 1
 
 
 def main():
@@ -269,6 +335,7 @@ def main():
         Path(args.output_dir),
         tokens_per_shard=args.tokens_per_shard,
         vocab_size=tokenizer.vocab_size,
+        eos_token_id=tokenizer.eos_token_id,
     )
 
     # Also save tokenizer config for reference

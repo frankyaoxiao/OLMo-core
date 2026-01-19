@@ -7,6 +7,7 @@ Modified to run without Beaker - use torchrun directly.
 
 import argparse
 import fnmatch
+import json
 import logging
 import os
 import sys
@@ -240,7 +241,7 @@ def build_sft_dataset(
         paths=token_id_paths,
         expand_glob=expand_glob,
         label_mask_paths=label_mask_paths,
-        generate_doc_lengths=True,  # ...and mask attention so that they don't attend to each other
+        generate_doc_lengths=True,
         long_doc_strategy=LongDocStrategy.truncate,  # truncate docs...
         sequence_length=sequence_length,  # ...that are over this length
     )
@@ -278,6 +279,7 @@ class SFTConfig(Config):
         overrides: List[str],
         dataset_path: str,
         save_folder: str,
+        checkpoint_path: str,
         init_seed: int = 33333,
     ) -> "SFTConfig":
         root_dir = get_root_dir(cluster)
@@ -330,30 +332,16 @@ class SFTConfig(Config):
             // (bs_config.cp_degree or 1),
         )
 
-        model = TransformerConfig.olmo2_7B(vocab_size=tokenizer_config.padded_vocab_size())
-        model.block.attention.sliding_window = SlidingWindowAttentionConfig(
-            force_full_attention_on_first_layer=False,
-            force_full_attention_on_last_layer=True,
-            pattern=[4096, 4096, 4096, -1],
-        )
-        model.block.attention.use_flash = True
-        if model.block.attention.rope is not None:
-            model.block.attention.rope.scaling = YaRNRoPEScalingConfig(
-                factor=8, beta_fast=32, beta_slow=1, old_context_len=8192
-            )
-
-        def no_rope_scaling(block: TransformerBlockConfig) -> TransformerBlockConfig:
-            rope_config = block.attention.rope
-            if rope_config is not None:
-                rope_config.scaling = None
-                block.attention.rope = rope_config
-            return block
-
-        model.block_overrides = {
-            i: no_rope_scaling(model.block.copy())
-            for i in range(model.n_layers)
-            if model.block.attention.sliding_window.should_use_swa(i, model.n_layers)
-        }
+        # Load model config directly from the checkpoint's config.json
+        # This ensures exact architecture match with the pretrained model
+        # Note: checkpoint_path may point to model_and_optim subdirectory, so check parent too
+        ckpt_config_path = join_path(checkpoint_path, "config.json")
+        if not os.path.exists(ckpt_config_path):
+            ckpt_config_path = join_path(get_parent(checkpoint_path), "config.json")
+        log.info(f"Loading model config from checkpoint: {ckpt_config_path}")
+        with open(ckpt_config_path) as f:
+            ckpt_config = json.load(f)
+        model = TransformerConfig.from_dict(ckpt_config["model"])
 
         config = SFTConfig(
             run_name=run_name,
@@ -552,6 +540,7 @@ Examples:
         overrides=overrides,
         dataset_path=args.dataset_path,
         save_folder=args.save_folder,
+        checkpoint_path=args.pretrain_checkpoint,
     )
 
     # Print the config for debugging and then execute the command.

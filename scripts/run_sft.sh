@@ -12,8 +12,9 @@ torchrun --nnodes=1 --nproc_per_node=8 \
     /mnt/polished-lake/home/fxiao-two/OLMo-core/checkpoints/olmo3-7b-think-base/model_and_optim \
     h100 \
     --seq_len=8192 \
-    --dataset_path=/mnt/polished-lake/home/fxiao-two/OLMo-core/data/sft_numpy \
-    --save_folder=/mnt/polished-lake/home/fxiao-two/OLMo-core/checkpoints/olmo3-7b-sft-output \
+    --dataset_path=/mnt/polished-lake/home/fxiao-two/OLMo-core/data/sft_numpy_fixed \
+    --save_folder=/mnt/polished-lake/home/fxiao-two/OLMo-core/checkpoints/olmo3-7b-sft-real \
     --trainer.max_duration.value=1 \
     --trainer.max_duration.unit=epochs \
+    --train_module.compile_model=False \
     "$@"
